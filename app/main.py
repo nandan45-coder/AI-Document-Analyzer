@@ -11,6 +11,7 @@ from app.models.embedding import Embedding
 from app.routes.upload import router
 from app.routes.process import router as process_router
 from app.routes.chunk import router as chunk_router
+from app.routes import ats
 from app.routes.embedding import (
     router as embedding_router
 )
@@ -50,6 +51,7 @@ app.include_router(search_router)
 app.include_router(chat_router)
 app.include_router(summary_router)
 app.include_router(resume_router)
+app.include_router(ats.router)
 
 
 @app.get("/")
