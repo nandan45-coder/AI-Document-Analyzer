@@ -9,28 +9,20 @@ from app.data.roles import ROLE_SKILLS
 from app.services.gemini_service import model
 
 
-class JDMatcherService:
+class CareerRecommendationService:
 
     def __init__(self):
 
         self.db: Session = SessionLocal()
 
-
-    def get_resume_text(
-        self,
-        document_id: int
-    ):
+    def get_resume_text(self, document_id: int):
 
         chunks = (
-
             self.db.query(Chunk)
-
             .filter(
                 Chunk.document_id == document_id
             )
-
             .all()
-
         )
 
         if not chunks:
@@ -47,30 +39,15 @@ class JDMatcherService:
 
         return resume
 
-
-    def calculate_role_match(
-
-        self,
-
-        resume_text,
-
-        selected_roles
-
-    ):
+    def calculate_role_scores(self, resume_text):
 
         resume = resume_text.lower()
 
         results = []
 
-        for role in selected_roles:
+        for role_name, role_data in ROLE_SKILLS.items():
 
-            if role not in ROLE_SKILLS:
-
-                continue
-
-            role_data = ROLE_SKILLS[role]
-
-            skills = role_data["skills"]
+            required_skills = role_data["skills"]
 
             matched = []
 
@@ -78,7 +55,7 @@ class JDMatcherService:
 
             score = 0
 
-            for skill in skills:
+            for skill in required_skills:
 
                 if skill.lower() in resume:
 
@@ -92,7 +69,7 @@ class JDMatcherService:
 
             percentage = round(
 
-                (score / len(skills)) * 100,
+                (score / len(required_skills)) * 100,
 
                 2
 
@@ -102,7 +79,7 @@ class JDMatcherService:
 
                 {
 
-                    "role": role,
+                    "role": role_name,
 
                     "match_score": percentage,
 
@@ -132,73 +109,74 @@ class JDMatcherService:
 
         return results
 
+    def get_top_roles(
+
+            self,
+
+            role_scores,
+
+            top_n=5
+
+    ):
+
+        return role_scores[:top_n]
 
     def build_prompt(
 
-        self,
+            self,
 
-        resume_text,
+            resume_text,
 
-        results
+            top_roles
 
     ):
 
         prompt = f"""
-You are an ATS Resume Expert.
+You are an Expert Career Guidance AI.
 
-Candidate Resume
+A candidate uploaded the following resume.
+
+Resume:
 
 {resume_text}
 
-The resume has been compared against the following job roles.
+Based on the following Top Career Matches:
 
-{json.dumps(results,indent=4)}
+{json.dumps(top_roles, indent=4)}
 
-For EACH role generate:
-
-1 Why candidate matches
-
-2 Missing Skills
-
-3 Improvement Suggestions
-
-4 Learning Roadmap
-
-5 Interview Readiness
+Generate career recommendations.
 
 Return ONLY JSON.
 
-Format
+Required Format:
 
 {{
-"results":[
-{{
-"role":"",
-"match_score":0,
-"matched_skills":[],
-"missing_skills":[],
-"why_match":"",
-"improvements":[],
-"learning_roadmap":[],
-"interview_readiness":""
-}}
-]
+    "career_recommendations":[
+        {{
+            "role":"",
+            "match_score":0,
+            "why_this_role":"",
+            "career_level":"",
+            "salary_range":"",
+            "matched_skills":[],
+            "missing_skills":[],
+            "learning_roadmap":[
+                ""
+            ],
+            "interview_tips":[
+                ""
+            ]
+        }}
+    ]
 }}
 """
 
         return prompt
 
-    def match_resume(
-        self,
-        document_id: int,
-        selected_roles: list
-    ):
-
+    def recommend_career(self, document_id: int):
         try:
 
-            resume_text = self.get_resume_text(
-                document_id
-            )
+            resume_text = self.get_resume_text(document_id)
 
             if resume_text is None:
 
@@ -207,65 +185,64 @@ Format
                     "message": "Resume not found."
                 }
 
-            role_results = self.calculate_role_match(
-                resume_text,
-                selected_roles
+            role_scores = self.calculate_role_scores(
+                resume_text
             )
 
-            if len(role_results) == 0:
-
-                return {
-                    "success": False,
-                    "message": "No valid roles selected."
-                }
+            top_roles = self.get_top_roles(
+                role_scores,
+                top_n=5
+            )
 
             prompt = self.build_prompt(
                 resume_text,
-                role_results
+                top_roles
             )
 
-            response = model.generate_content(
-                prompt
-            )
+            response = model.generate_content(prompt)
 
-            output = response.text.strip()
+            raw_response = response.text.strip()
 
-            if output.startswith("```json"):
+            if raw_response.startswith("```json"):
 
-                output = (
-                    output
+                raw_response = (
+                    raw_response
                     .replace("```json", "")
                     .replace("```", "")
                     .strip()
                 )
 
-            elif output.startswith("```"):
+            elif raw_response.startswith("```"):
 
-                output = (
-                    output
+                raw_response = (
+                    raw_response
                     .replace("```", "")
                     .strip()
                 )
 
             try:
 
-                ai_result = json.loads(output)
+                gemini_result = json.loads(
+                    raw_response
+                )
 
             except Exception:
 
-                ai_result = {
-                    "results": role_results
+                gemini_result = {
+                    "career_recommendations": top_roles
                 }
 
             return {
 
                 "success": True,
 
-                "roles_selected": len(
-                    selected_roles
+                "total_roles_checked": len(
+                    ROLE_SKILLS
                 ),
 
-                "results": ai_result["results"]
+                "top_matching_roles": top_roles,
+
+                "ai_career_guidance": gemini_result
 
             }
 
@@ -284,4 +261,4 @@ Format
             self.db.close()
 
 
-jd_match_service = JDMatcherService()
+career_service = CareerRecommendationService()

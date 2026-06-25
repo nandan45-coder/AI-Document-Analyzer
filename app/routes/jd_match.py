@@ -1,30 +1,32 @@
-from fastapi import APIRouter
-from fastapi import HTTPException
+from fastapi import APIRouter, HTTPException
 
 from app.schemas.jd_match import JDMatchRequest
-from app.services.jd_match_service import match_resume_with_jd
+from app.services.jd_match_service import jd_match_service
 
 router = APIRouter(
-    prefix="",
-    tags=["Resume vs Job Description Matching"]
+    prefix="/jd-match",
+    tags=["Multi-Role JD Matcher"]
 )
 
 
-@router.post("/jd-match/{document_id}")
-def jd_match(
+@router.post("/{document_id}")
+def match_resume(
     document_id: int,
     request: JDMatchRequest
 ):
+    """
+    Compare an uploaded resume against multiple selected job roles.
+    """
 
-    result = match_resume_with_jd(
+    result = jd_match_service.match_resume(
         document_id=document_id,
-        job_description=request.job_description
+        selected_roles=request.selected_roles
     )
 
-    if "error" in result:
+    if not result["success"]:
         raise HTTPException(
             status_code=400,
-            detail=result["error"]
+            detail=result.get("message", result.get("error"))
         )
 
     return result
