@@ -34,6 +34,9 @@ from app.routes.resume import (
 from app.routes.career import (
     router as career_router
 )
+from app.routes.resume_improver import (
+    router as resume_improver_router
+)
 
 # Create Database Tables
 Base.metadata.create_all(bind=engine)
@@ -58,6 +61,8 @@ app.include_router(resume_router)
 app.include_router(ats.router)
 app.include_router(jd_match_router)
 app.include_router(career_router)
+app.include_router(resume_improver_router)
+
 
 
 @app.get("/")
