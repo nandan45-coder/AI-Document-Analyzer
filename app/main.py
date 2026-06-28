@@ -37,6 +37,13 @@ from app.routes.career import (
 from app.routes.resume_improver import (
     router as resume_improver_router
 )
+from app.routes.score_dashboard import (
+    router as score_dashboard_router
+)
+from app.routes.interview import (
+    router as interview_router
+)
+
 
 # Create Database Tables
 Base.metadata.create_all(bind=engine)
@@ -62,6 +69,8 @@ app.include_router(ats.router)
 app.include_router(jd_match_router)
 app.include_router(career_router)
 app.include_router(resume_improver_router)
+app.include_router(score_dashboard_router)
+app.include_router(interview_router)
 
 
 
