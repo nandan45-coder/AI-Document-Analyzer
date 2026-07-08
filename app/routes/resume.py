@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from fastapi import HTTPException
 
-from app.services.resume_analyzer import (
+from app.services.resume_analyzer_service import (
     analyze_resume
 )
 

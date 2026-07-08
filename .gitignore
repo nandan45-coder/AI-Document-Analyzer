@@ -1,16 +1,27 @@
-__pycache__/
-*.pyc
-
-.env
-
-documents.db
-
-uploads/
-
-chroma_db/
-
+# Virtual Environment
+.venv/
 venv/
 
-.idea/
+# Python Cache
+__pycache__/
+*.py[cod]
 
+# Environment Variables
+.env
+
+# Database
+*.db
+
+# Upload folders
+uploads/
+temp_govt_documents/
+
+# Vector Database
+chroma_db/
+
+# VS Code
 .vscode/
+
+# OS Files
+.DS_Store
+Thumbs.db
