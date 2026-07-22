@@ -1,21 +1,20 @@
+import difflib
 import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import fitz
 import numpy as np
 
+from app.services.govt_ocr_service import govt_ocr_service
 from app.utils.govt_common import PDF_RENDER_ZOOM, normalize_ocr_spacing
-import re
 
 logger = logging.getLogger("govt_document_intelligence")
 
 # pyzbar gives reliable TYPE classification (QR vs 1D barcode) in addition to
-# decoding. This is what fixes the earlier bug where a linear barcode was
-# being reported as a detected QR code. OpenCV's QRCodeDetector is still used
-# as a secondary confirmation path, but is no longer trusted to distinguish
-# barcode-vs-QR on its own.
+# decoding. Optional - falls back to OpenCV QRCodeDetector-only behavior.
 try:
     from pyzbar.pyzbar import decode as zbar_decode
     PYZBAR_AVAILABLE = True
@@ -24,12 +23,9 @@ except ImportError:
     logger.warning(
         "pyzbar not installed - QR/barcode TYPE classification will rely on "
         "OpenCV only, which cannot reliably distinguish a 1D barcode from a "
-        "QR code. Install pyzbar (and the system libzbar0 library) for "
-        "accurate barcode detection."
+        "QR code."
     )
 
-# Text phrases that indicate a digital signature / verification block on
-# Maharashtra certificates. Matched against OCR text case-insensitively.
 DIGITAL_SIGNATURE_PATTERNS = [
     r"digitally signed",
     r"digital signature",
@@ -37,9 +33,6 @@ DIGITAL_SIGNATURE_PATTERNS = [
     r"signature valid",
 ]
 
-# Matched against BOTH the raw OCR text and a punctuation-normalized version
-# (spaces stripped from around ':', '/', '.'), since OCR very commonly
-# fragments URLs with stray spaces on scanned government certificates.
 VERIFICATION_URL_PATTERN = (
     r"(https?://[^\s]+|www\.[^\s]+|[a-z0-9\-]+\.maharashtra\.gov\.in[^\s]*)"
 )
@@ -50,10 +43,32 @@ SIGNATURE_VALIDATION_PATTERNS = [
     r"authenticated (copy|document)",
 ]
 
-# Full-page symbol search is capped to this max dimension (longer side) for
-# speed - template matching cost grows with image area, and certificate
-# scans/renders can be very large at 3x PDF zoom.
+# Positive / pending verification-text keyword sets used by the rule-based
+# confidence engine. Matched both exactly and fuzzily (OCR-corrupted text
+# tolerant) via _extract_verification_text().
+POSITIVE_TEXT_KEYWORDS = [
+    "verified", "verification successful", "signature valid",
+    "digitally signed", "valid",
+]
+
+PENDING_TEXT_KEYWORDS = [
+    "pending verification", "verification pending", "under process",
+    "awaiting verification",
+]
+
+CONTEXT_TEXT_KEYWORDS = [
+    "government of maharashtra", "authority",
+]
+
+FUZZY_MATCH_CUTOFF = 0.72
+
+# Whole-page fallback search is capped to this max dimension for speed.
 MAX_SEARCH_DIMENSION = 2000
+
+# Feature-matching templates are upscaled/downscaled to this max dimension -
+# larger than the 40x40 template-matching version, since ORB/AKAZE/SIFT need
+# more pixels to find usable keypoints on simple flat-color icon graphics.
+FEATURE_TEMPLATE_MAX_DIM = 220
 
 
 class GovtVerificationService:
@@ -63,24 +78,79 @@ class GovtVerificationService:
         self.green_template_path = "app/assets/green_tick.png"
         self.yellow_template_path = "app/assets/yellow_question.png"
 
-        self.match_threshold = 0.75
+        self.match_threshold = 0.60
 
-        # Load templates ONCE instead of on every verify_document() call.
-        self.green_template = self._load_template(self.green_template_path, "Green Tick")
-        self.yellow_template = self._load_template(self.yellow_template_path, "Yellow Question")
+        # Templates are loaded defensively - a missing template file must
+        # never crash the whole application at import time. If loading
+        # fails, template/feature matching for that symbol is skipped at
+        # request time (still returns a graceful "Not Detected" result)
+        # rather than raising.
+        self.green_template = self._safe_load_template(self.green_template_path, "Green Tick")
+        self.yellow_template = self._safe_load_template(self.yellow_template_path, "Yellow Question")
 
-        self.green_gray = cv2.resize(
-            cv2.cvtColor(self.green_template, cv2.COLOR_BGR2GRAY), (40, 40)
-        )
-        self.yellow_gray = cv2.resize(
-            cv2.cvtColor(self.yellow_template, cv2.COLOR_BGR2GRAY), (40, 40)
-        )
+        self.green_gray = self._make_match_template(self.green_template)
+        self.yellow_gray = self._make_match_template(self.yellow_template)
 
-    def _load_template(self, path: str, label: str) -> np.ndarray:
+        # Feature detectors - created once and reused across requests.
+        # Guarded defensively: some OpenCV builds/versions (seen on certain
+        # Windows installs) don't expose every detector, e.g. AKAZE_create
+        # can be missing depending on build flags. A missing detector must
+        # never crash app startup - it's simply skipped at match time.
+        try:
+            self.orb = cv2.ORB_create(nfeatures=1000)
+        except Exception:
+            self.orb = None
+            logger.warning("cv2.ORB_create unavailable in this OpenCV build - ORB feature matching disabled.")
+
+        try:
+            self.akaze = cv2.AKAZE_create()
+        except Exception:
+            self.akaze = None
+            logger.warning("cv2.AKAZE_create unavailable in this OpenCV build - AKAZE feature matching disabled.")
+
+        try:
+            self.sift = cv2.SIFT_create()
+        except Exception:
+            self.sift = None
+            logger.info("SIFT not available in this OpenCV build - skipping optional SIFT fallback.")
+
+        self._template_feature_cache: Dict[Tuple[str, str], Tuple[Any, Any]] = {}
+
+        self.green_feature_gray = self._make_feature_template(self.green_template)
+        self.yellow_feature_gray = self._make_feature_template(self.yellow_template)
+
+    # ---------------------------------------------------
+    # Defensive template loading / preparation
+    # ---------------------------------------------------
+
+    def _safe_load_template(self, path: str, label: str) -> Optional[np.ndarray]:
         template = cv2.imread(path)
         if template is None:
-            raise Exception(f"{label} template not found at {path}.")
+            logger.error(
+                "%s template not found at %s - symbol detection for this "
+                "symbol will be skipped gracefully instead of crashing.",
+                label, path,
+            )
         return template
+
+    def _make_match_template(self, template: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if template is None:
+            return None
+        return cv2.resize(cv2.cvtColor(template, cv2.COLOR_BGR2GRAY), (40, 40))
+
+    def _make_feature_template(self, template: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if template is None:
+            return None
+        gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        return self._resize_max_dim(gray, FEATURE_TEMPLATE_MAX_DIM)
+
+    def _resize_max_dim(self, image: np.ndarray, max_dim: int) -> np.ndarray:
+        height, width = image.shape[:2]
+        longest = max(height, width)
+        if longest <= max_dim:
+            return image
+        scale = max_dim / longest
+        return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
     # =====================================================
     # Main Verification Function
@@ -95,30 +165,71 @@ class GovtVerificationService:
         try:
             image = self.load_document(file_path)
 
-            symbol_result = self.detect_verification_symbol(image)
+            physical_size_cm = self._get_physical_page_size_cm(file_path)
+
+            crop, offset, region_meta = self._get_verification_crop(image, physical_size_cm)
+
+            primary = self._analyze_verification_region(
+                crop, offset, region_meta, stage="bottom_right_crop"
+            )
+
+            # Secondary whole-document search only runs if the targeted
+            # region found neither a symbol nor supporting verification
+            # text - keeps the common case fast while staying robust for
+            # the minority of documents laid out differently.
+            if not primary["symbol_found"] and not primary["verification_text_found"]:
+                fallback_meta = {
+                    "location": "Full Page (Fallback)",
+                    "crop_percentage": {"width": 100.0, "height": 100.0},
+                    "bounding_box": [0, 0, image.shape[1], image.shape[0]],
+                }
+                fallback = self._analyze_verification_region(
+                    image, (0, 0), fallback_meta, stage="full_page_fallback"
+                )
+                if fallback["symbol_found"] or fallback["verification_text_found"]:
+                    primary = fallback
 
             qr_barcode_result = self.detect_qr_and_barcode(image)
-
             seal_result = self.detect_seal_or_emblem(image)
-
             watermark_result = self.detect_watermark(image)
-
             text_indicators = self.detect_text_indicators(ocr_text)
-
             quality = self.analyze_document_quality(image)
 
             authenticity_signals = sum([
-                symbol_result.get("verification_symbol") == "Green Tick",
+                primary["symbol_label"] == "Green Tick",
                 qr_barcode_result.get("qr_detected", False),
                 qr_barcode_result.get("barcode_detected", False),
                 seal_result.get("seal_detected", False),
                 text_indicators.get("digital_signature_found", False),
                 text_indicators.get("verification_url_found", False),
+                primary["verification_text_found"],
             ])
 
             result = {
                 "success": True,
-                **symbol_result,
+
+                # --- Preserved keys (backward compatible) ---
+                "verification_status": primary["verification_status"],
+                "verification_symbol": primary["symbol_label"],
+                "ready_for_submission": primary["ready_for_submission"],
+                "confidence": primary["shape_color_confidence"],
+
+                # --- New/extended keys (additive only) ---
+                "detected_symbol": primary["symbol_label"],
+                "template_score": primary["template_score"],
+                "feature_score": primary["feature_score"],
+                "feature_matching_method": primary["feature_matching_method"],
+                "verification_text": primary["verification_text"],
+                "verification_text_confidence": primary["verification_text_confidence"],
+                "region_ocr_confidence": primary["region_ocr_confidence"],
+                "detection_region": primary["region_meta"],
+                "matching_method": primary["matching_method"],
+                "overall_confidence": primary["overall_confidence"],
+                "overall_confidence_rule": primary["overall_confidence_rule"],
+                "search_stage": primary["search_stage"],
+                "symbol_location": primary["symbol_location"],
+                "debug_scores": primary["debug_scores"],
+
                 "qr_code": qr_barcode_result,
                 "seal_or_emblem": seal_result,
                 "watermark": watermark_result,
@@ -137,12 +248,7 @@ class GovtVerificationService:
             }
 
     # =====================================================
-    # Load PDF / Image
-    # Uses the SAME PDF_RENDER_ZOOM as govt_ocr_service.py so verification
-    # and OCR are always working off matching resolution - previously this
-    # rendered at the default 72 DPI while OCR used 3x zoom, which directly
-    # hurt template-matching precision and skewed the document_quality
-    # resolution/blur scores.
+    # Load PDF / Image (matches govt_ocr_service.py's PDF zoom exactly)
     # =====================================================
 
     def load_document(self, file_path: str) -> np.ndarray:
@@ -175,128 +281,319 @@ class GovtVerificationService:
         return image
 
     # =====================================================
-    # Detect Verification Symbol (Green Tick / Yellow Question)
+    # Adaptive Verification Region Localization
     #
-    # Previously this only looked inside a HARDCODED crop box
-    # (top 5-32%, right 68-98%). Real certificates place these symbols
-    # inconsistently - e.g. a "Signature valid" tick can sit next to the
-    # signature block in the middle of the page rather than the top-right
-    # corner. This now searches the WHOLE page and reports wherever the
-    # best match is found, which fixes false negatives on layouts that
-    # don't match the old assumed position.
+    # Grounded in real-world observation: the verification symbol is almost
+    # always in the bottom-right ~14cm x 10cm area. For PDFs we know the
+    # actual physical page size, so the crop fraction is computed exactly
+    # from that (14cm / page_width_cm, 10cm / page_height_cm). For plain
+    # images (scans, mobile photos) physical size is unknown, so we fall
+    # back to a fixed percentage (28% width x 22% height) tuned to
+    # approximate that same real-world area on a typical A4-ish document -
+    # still adaptive to the image's actual pixel dimensions, just not to
+    # unknown physical units.
     # =====================================================
 
-    def detect_verification_symbol(self, image: np.ndarray) -> Dict[str, Any]:
+    def _get_physical_page_size_cm(self, file_path: str) -> Optional[Tuple[float, float]]:
 
-        search_image, scale_factor = self._resize_for_search(image)
-        gray_full = cv2.cvtColor(search_image, cv2.COLOR_BGR2GRAY)
+        if os.path.splitext(file_path)[1].lower() != ".pdf":
+            return None
 
-        green_score, green_loc, green_size = self._multi_scale_match_with_location(
-            gray_full, self.green_gray
+        try:
+            document = fitz.open(file_path)
+            page = document.load_page(0)
+            width_cm = page.rect.width * 2.54 / 72.0
+            height_cm = page.rect.height * 2.54 / 72.0
+            document.close()
+            return width_cm, height_cm
+        except Exception:
+            logger.exception("Could not read physical PDF page size - falling back to percentage crop.")
+            return None
+
+    def _get_verification_crop(
+        self,
+        image: np.ndarray,
+        physical_size_cm: Optional[Tuple[float, float]],
+    ) -> Tuple[np.ndarray, Tuple[int, int], Dict[str, Any]]:
+
+        height, width = image.shape[:2]
+
+        if physical_size_cm:
+            width_cm, height_cm = physical_size_cm
+            crop_w_fraction = min(max(14.0 / max(width_cm, 1.0), 0.15), 0.60)
+            crop_h_fraction = min(max(10.0 / max(height_cm, 1.0), 0.15), 0.60)
+        else:
+            crop_w_fraction = 0.28
+            crop_h_fraction = 0.22
+
+        left = int(width * (1 - crop_w_fraction))
+        top = int(height * (1 - crop_h_fraction))
+
+        crop = image[top:height, left:width]
+
+        if crop.size == 0:
+            crop = image
+            left, top = 0, 0
+
+        region_meta = {
+            "location": "Bottom Right",
+            "crop_percentage": {
+                "width": round(crop_w_fraction * 100, 2),
+                "height": round(crop_h_fraction * 100, 2),
+            },
+            "bounding_box": [left, top, width - left, height - top],
+        }
+
+        return crop, (left, top), region_meta
+
+    # =====================================================
+    # Region Analysis Pipeline
+    # (preprocessing -> template match -> feature match -> OCR ->
+    #  verification text -> confidence)
+    # =====================================================
+
+    def _analyze_verification_region(
+        self,
+        region_bgr: np.ndarray,
+        offset: Tuple[int, int],
+        region_meta: Optional[Dict[str, Any]],
+        stage: str,
+    ) -> Dict[str, Any]:
+
+        enhanced_gray, enhanced_bgr, ocr_ready = self._preprocess_region(region_bgr)
+
+        search_gray, scale_factor = self._resize_for_search(enhanced_gray)
+        search_bgr = cv2.resize(
+            enhanced_bgr, (search_gray.shape[1], search_gray.shape[0]),
+            interpolation=cv2.INTER_AREA,
         )
-        yellow_score, yellow_loc, yellow_size = self._multi_scale_match_with_location(
-            gray_full, self.yellow_gray
+
+        # --- Template Matching ---
+        green_t_score, green_loc, green_size = self._multi_scale_match_with_location(
+            search_gray, self.green_gray
+        )
+        yellow_t_score, yellow_loc, yellow_size = self._multi_scale_match_with_location(
+            search_gray, self.yellow_gray
         )
 
         green_color_ratio = self._color_ratio_in_window(
-            search_image, green_loc, green_size, lower=(40, 40, 40), upper=(90, 255, 255)
+            search_bgr, green_loc, green_size, lower=(40, 40, 40), upper=(90, 255, 255)
         )
         yellow_color_ratio = self._color_ratio_in_window(
-            search_image, yellow_loc, yellow_size, lower=(20, 40, 40), upper=(35, 255, 255)
+            search_bgr, yellow_loc, yellow_size, lower=(20, 40, 40), upper=(35, 255, 255)
         )
 
-        green_combined = (green_score * 0.7) + (min(green_color_ratio * 5, 1.0) * 0.3)
-        yellow_combined = (yellow_score * 0.7) + (min(yellow_color_ratio * 5, 1.0) * 0.3)
+        # --- Feature Matching (ORB preferred, AKAZE fallback, SIFT optional) ---
+        # Scoped to a padded window around each template's own best-match
+        # location (not the whole crop) - previously this ran on the entire
+        # search region, which diluted real keypoint matches near the true
+        # icon with incidental matches to unrelated nearby text/seal edges.
+        green_window = self._extract_window_with_padding(search_gray, green_loc, green_size)
+        yellow_window = self._extract_window_with_padding(search_gray, yellow_loc, yellow_size)
 
-        if green_combined > yellow_combined and green_combined >= self.match_threshold:
-            return {
-                "verification_status": "Verified",
-                "verification_symbol": "Green Tick",
-                "ready_for_submission": True,
-                "confidence": round(green_combined * 100, 2),
-                "symbol_location": self._scale_location(green_loc, scale_factor),
-            }
+        green_feature_score, green_feature_method = self._feature_match_score(
+            green_window, "green"
+        )
+        yellow_feature_score, yellow_feature_method = self._feature_match_score(
+            yellow_window, "yellow"
+        )
 
-        elif yellow_combined > green_combined and yellow_combined >= self.match_threshold:
-            return {
-                "verification_status": "Verification Pending",
-                "verification_symbol": "Yellow Question Mark",
-                "ready_for_submission": False,
-                "confidence": round(yellow_combined * 100, 2),
-                "symbol_location": self._scale_location(yellow_loc, scale_factor),
-            }
+        green_capped_color = min(green_color_ratio * 5, 1.0)
+        yellow_capped_color = min(yellow_color_ratio * 5, 1.0)
 
-        return {
-            "verification_status": "Unknown",
-            "verification_symbol": "Not Detected",
-            "ready_for_submission": False,
-            "confidence": round(max(green_combined, yellow_combined) * 100, 2),
-            "symbol_location": None,
+        # Rebalanced weights: template shape (0.50) and exact color presence
+        # (0.30) are far more reliable for these flat, single-color icon
+        # templates than ORB/AKAZE/SIFT feature counts (0.20), which have
+        # very few real keypoints to work with on simple graphics and tend
+        # to sit near their structural floor regardless of a true match.
+        green_combined = (
+            (green_t_score * 0.50) + (green_capped_color * 0.30) + (green_feature_score * 0.20)
+        )
+        yellow_combined = (
+            (yellow_t_score * 0.50) + (yellow_capped_color * 0.30) + (yellow_feature_score * 0.20)
+        )
+
+        # Strong-evidence rule: when template shape AND exact color presence
+        # are BOTH independently strong, that combination is overwhelming
+        # evidence of a genuine match on its own - a weak/noisy feature
+        # score (which is expected and normal for flat icon graphics)
+        # should not be able to hold a confident detection back. Mirrors
+        # the same rule-based-boost approach already used for the
+        # overall_confidence engine below.
+        STRONG_TEMPLATE_THRESHOLD = 0.55
+        STRONG_COLOR_THRESHOLD = 0.65
+        STRONG_EVIDENCE_FLOOR = 0.85
+
+        green_strong_evidence = (
+            green_t_score >= STRONG_TEMPLATE_THRESHOLD
+            and green_capped_color >= STRONG_COLOR_THRESHOLD
+        )
+        yellow_strong_evidence = (
+            yellow_t_score >= STRONG_TEMPLATE_THRESHOLD
+            and yellow_capped_color >= STRONG_COLOR_THRESHOLD
+        )
+
+        if green_strong_evidence:
+            green_combined = max(green_combined, STRONG_EVIDENCE_FLOOR)
+
+        if yellow_strong_evidence:
+            yellow_combined = max(yellow_combined, STRONG_EVIDENCE_FLOOR)
+
+        debug_scores = {
+            "green_template_score": round(green_t_score, 3),
+            "yellow_template_score": round(yellow_t_score, 3),
+            "green_color_ratio": round(green_color_ratio, 3),
+            "yellow_color_ratio": round(yellow_color_ratio, 3),
+            "green_feature_score": round(green_feature_score, 3),
+            "yellow_feature_score": round(yellow_feature_score, 3),
+            "green_strong_evidence_bonus_applied": green_strong_evidence,
+            "yellow_strong_evidence_bonus_applied": yellow_strong_evidence,
+            "green_combined": round(green_combined, 3),
+            "yellow_combined": round(yellow_combined, 3),
+            "match_threshold": self.match_threshold,
+            "search_stage": stage,
         }
 
-    def _resize_for_search(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
-        height, width = image.shape[:2]
-        longest_side = max(height, width)
+        symbol_label = "Not Detected"
+        symbol_location = None
+        shape_color_confidence = round(max(green_combined, yellow_combined) * 100, 2)
+        template_score = round(max(green_t_score, yellow_t_score) * 100, 2)
+        feature_score = round(max(green_feature_score, yellow_feature_score) * 100, 2)
+        feature_method = None
+        verification_status = "Unknown"
+        ready_for_submission = False
 
-        if longest_side <= MAX_SEARCH_DIMENSION:
-            return image, 1.0
+        if green_combined > yellow_combined and green_combined >= self.match_threshold:
+            symbol_label = "Green Tick"
+            verification_status = "Verified"
+            ready_for_submission = True
+            shape_color_confidence = round(green_combined * 100, 2)
+            symbol_location = self._scale_and_offset_location(green_loc, scale_factor, offset)
+            feature_method = green_feature_method
 
-        scale_factor = MAX_SEARCH_DIMENSION / longest_side
-        resized = cv2.resize(
-            image, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA
+        elif yellow_combined > green_combined and yellow_combined >= self.match_threshold:
+            symbol_label = "Yellow Question Mark"
+            verification_status = "Verification Pending"
+            ready_for_submission = False
+            shape_color_confidence = round(yellow_combined * 100, 2)
+            symbol_location = self._scale_and_offset_location(yellow_loc, scale_factor, offset)
+            feature_method = yellow_feature_method
+
+        symbol_found = symbol_label != "Not Detected"
+
+        # --- OCR on the verification region (binarized, OCR-optimized crop) ---
+        region_text, region_ocr_confidence = govt_ocr_service.run_easyocr(ocr_ready)
+        region_ocr_confidence = round(region_ocr_confidence * 100, 2)
+
+        matched_keywords, verification_text_confidence = self._extract_verification_text(region_text)
+        verification_text_found = len(matched_keywords) > 0
+
+        matched_positive = any(m["keyword"] in POSITIVE_TEXT_KEYWORDS for m in matched_keywords)
+        matched_pending = any(m["keyword"] in PENDING_TEXT_KEYWORDS for m in matched_keywords)
+
+        overall_confidence, overall_rule = self._compute_overall_verification_confidence(
+            symbol_label=symbol_label,
+            shape_feature_score=max(green_combined, yellow_combined),
+            ocr_confidence=region_ocr_confidence,
+            text_confidence=verification_text_confidence,
+            matched_positive=matched_positive,
+            matched_pending=matched_pending,
         )
-        return resized, scale_factor
 
-    def _scale_location(self, loc: Optional[Tuple[int, int]], scale_factor: float):
-        if loc is None:
-            return None
-        return {"x": int(loc[0] / scale_factor), "y": int(loc[1] / scale_factor)}
+        matching_method_parts = ["template", "color"]
+        if feature_method:
+            matching_method_parts.append(f"feature({feature_method})")
+        if verification_text_found:
+            matching_method_parts.append("ocr_text")
+        matching_method = "+".join(matching_method_parts)
 
-    def _color_ratio_in_window(
-        self,
-        image_bgr: np.ndarray,
-        loc: Optional[Tuple[int, int]],
-        size: Optional[Tuple[int, int]],
-        lower: tuple,
-        upper: tuple,
-    ) -> float:
-        """
-        Computes the color-mask ratio inside the specific matched window
-        rather than across the whole page. Checking the whole page (as the
-        previous implementation did) dilutes the signal - a small green tick
-        on a large white page barely moves a page-wide ratio. Checking just
-        the matched window makes color a meaningful disambiguator again.
-        """
+        return {
+            "symbol_label": symbol_label,
+            "symbol_found": symbol_found,
+            "symbol_location": symbol_location,
+            "verification_status": verification_status,
+            "ready_for_submission": ready_for_submission,
+            "shape_color_confidence": shape_color_confidence,
+            "template_score": template_score,
+            "feature_score": feature_score,
+            "feature_matching_method": feature_method,
+            "region_ocr_confidence": region_ocr_confidence,
+            "verification_text": [m["keyword"] for m in matched_keywords],
+            "verification_text_confidence": verification_text_confidence,
+            "verification_text_found": verification_text_found,
+            "overall_confidence": overall_confidence,
+            "overall_confidence_rule": overall_rule,
+            "matching_method": matching_method,
+            "region_meta": region_meta,
+            "search_stage": stage,
+            "debug_scores": debug_scores,
+        }
 
-        if loc is None or size is None:
-            return 0.0
+    # =====================================================
+    # Region Preprocessing
+    # Resize, Grayscale, Contrast Enhancement, Histogram Equalization,
+    # Gaussian Blur / Noise Removal, Sharpening, Deskew, Adaptive Threshold.
+    #
+    # NOTE: template/feature matching and color-ratio checks need continuous
+    # tone + color information, so only the OCR-bound copy gets binarized.
+    # The matching copy is enhanced but never thresholded.
+    # =====================================================
 
-        x, y = loc
-        w, h = size
+    def _preprocess_region(self, region_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
-        window = image_bgr[y: y + h, x: x + w]
+        resized_bgr = cv2.resize(
+            region_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC
+        )
 
-        if window.size == 0:
-            return 0.0
+        gray = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2GRAY)
 
-        hsv = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        # Reuse the OCR service's deskew logic instead of duplicating it -
+        # keeps skew-correction behavior consistent across the module.
+        gray = govt_ocr_service.deskew_image(gray)
 
-        return float(np.count_nonzero(mask)) / mask.size
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+
+        equalized = cv2.equalizeHist(denoised)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        contrast_enhanced = clahe.apply(equalized)
+
+        blurred = cv2.GaussianBlur(contrast_enhanced, (3, 3), 0)
+
+        kernel = np.array([
+            [0, -1, 0],
+            [-1, 5, -1],
+            [0, -1, 0],
+        ])
+        sharpened = cv2.filter2D(blurred, -1, kernel)
+
+        # Matching copy: enhanced, NOT binarized - preserves gradients
+        # needed for template/feature matching.
+        enhanced_gray = sharpened
+
+        # OCR copy: binarized last, same order used in govt_ocr_service.py.
+        ocr_ready = cv2.adaptiveThreshold(
+            sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
+        )
+
+        return enhanced_gray, resized_bgr, ocr_ready
 
     # =====================================================
     # Multi-Scale Template Matching (with best-match location)
     # =====================================================
 
     def _multi_scale_match_with_location(
-        self, image: np.ndarray, template: np.ndarray
+        self, image: np.ndarray, template: Optional[np.ndarray]
     ) -> Tuple[float, Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+
+        if template is None:
+            return 0.0, None, None
 
         best_score = 0.0
         best_loc = None
         best_size = None
 
-        scales = [0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 2.0, 2.5]
+        scales = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5]
 
         for scale in scales:
             width = int(template.shape[1] * scale)
@@ -320,18 +617,273 @@ class GovtVerificationService:
 
         return best_score, best_loc, best_size
 
+    def _resize_for_search(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
+        height, width = image.shape[:2]
+        longest_side = max(height, width)
+
+        if longest_side <= MAX_SEARCH_DIMENSION:
+            return image, 1.0
+
+        scale_factor = MAX_SEARCH_DIMENSION / longest_side
+        resized = cv2.resize(
+            image, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA
+        )
+        return resized, scale_factor
+
+    def _scale_and_offset_location(
+        self,
+        loc: Optional[Tuple[int, int]],
+        scale_factor: float,
+        offset: Tuple[int, int],
+    ):
+        if loc is None:
+            return None
+
+        off_x, off_y = offset
+
+        return {
+            "x": int(loc[0] / scale_factor) + off_x,
+            "y": int(loc[1] / scale_factor) + off_y,
+        }
+
+    def _extract_window_with_padding(
+        self,
+        image: np.ndarray,
+        loc: Optional[Tuple[int, int]],
+        size: Optional[Tuple[int, int]],
+        padding_ratio: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Crops a window around a template match location, padded by
+        `padding_ratio` x the match size on each side, so feature matching
+        gets some surrounding context without diluting into unrelated
+        page content far away. Falls back to the full image if no
+        template match location is available (e.g. template missing).
+        """
+
+        if loc is None or size is None:
+            return image
+
+        x, y = loc
+        w, h = size
+
+        pad_x = int(w * padding_ratio)
+        pad_y = int(h * padding_ratio)
+
+        height, width = image.shape[:2]
+
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(width, x + w + pad_x)
+        y2 = min(height, y + h + pad_y)
+
+        window = image[y1:y2, x1:x2]
+
+        if window.size == 0:
+            return image
+
+        return window
+
+    def _color_ratio_in_window(
+        self,
+        image_bgr: np.ndarray,
+        loc: Optional[Tuple[int, int]],
+        size: Optional[Tuple[int, int]],
+        lower: tuple,
+        upper: tuple,
+    ) -> float:
+
+        if loc is None or size is None:
+            return 0.0
+
+        x, y = loc
+        w, h = size
+
+        window = image_bgr[y: y + h, x: x + w]
+
+        if window.size == 0:
+            return 0.0
+
+        hsv = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+
+        return float(np.count_nonzero(mask)) / mask.size
+
+    # =====================================================
+    # Feature Matching: ORB preferred, AKAZE fallback, SIFT optional
+    #
+    # Classical feature matching handles rotation, scale, lighting change,
+    # and partial visibility better than template matching alone - none of
+    # this requires any trained model or dataset.
+    # =====================================================
+
+    def _get_template_features(self, symbol: str, detector_name: str):
+
+        cache_key = (symbol, detector_name)
+        if cache_key in self._template_feature_cache:
+            return self._template_feature_cache[cache_key]
+
+        template_gray = self.green_feature_gray if symbol == "green" else self.yellow_feature_gray
+
+        if template_gray is None:
+            self._template_feature_cache[cache_key] = (None, None)
+            return None, None
+
+        detector = getattr(self, detector_name, None)
+
+        if detector is None:
+            self._template_feature_cache[cache_key] = (None, None)
+            return None, None
+
+        try:
+            kp, des = detector.detectAndCompute(template_gray, None)
+        except Exception:
+            logger.exception("Feature template computation failed for %s/%s", symbol, detector_name)
+            kp, des = None, None
+
+        self._template_feature_cache[cache_key] = (kp, des)
+        return kp, des
+
+    def _feature_match_score(self, region_gray: np.ndarray, symbol: str) -> Tuple[float, Optional[str]]:
+
+        detector_sequence = [("orb", cv2.NORM_HAMMING), ("akaze", cv2.NORM_HAMMING)]
+        if self.sift is not None:
+            detector_sequence.append(("sift", cv2.NORM_L2))
+
+        for detector_name, norm in detector_sequence:
+
+            if detector_name == "sift" and self.sift is None:
+                continue
+
+            detector = getattr(self, detector_name, None)
+
+            if detector is None:
+                continue
+
+            kp_t, des_t = self._get_template_features(symbol, detector_name)
+
+            if des_t is None or len(des_t) < 2:
+                continue
+
+            try:
+                kp_r, des_r = detector.detectAndCompute(region_gray, None)
+            except Exception:
+                continue
+
+            if des_r is None or len(des_r) < 2:
+                continue
+
+            try:
+                matcher = cv2.BFMatcher(norm)
+                raw_matches = matcher.knnMatch(des_t, des_r, k=2)
+            except Exception:
+                continue
+
+            good_matches = []
+            for pair in raw_matches:
+                if len(pair) == 2:
+                    m, n = pair
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
+
+            if not kp_t:
+                continue
+
+            score = min(len(good_matches) / len(kp_t), 1.0)
+
+            # A weak score from one detector is still worth trying the next
+            # (more robust) detector before giving up entirely.
+            if score >= 0.12:
+                return score, detector_name
+
+        return 0.0, None
+
+    # =====================================================
+    # Verification Text Extraction (exact + fuzzy/OCR-tolerant matching)
+    # =====================================================
+
+    def _extract_verification_text(self, region_text: str) -> Tuple[List[Dict[str, Any]], float]:
+
+        if not region_text or not region_text.strip():
+            return [], 0.0
+
+        text_lower = region_text.lower()
+        lines = [line.strip() for line in text_lower.split("\n") if line.strip()]
+
+        all_keywords = POSITIVE_TEXT_KEYWORDS + PENDING_TEXT_KEYWORDS + CONTEXT_TEXT_KEYWORDS
+        matched: List[Dict[str, Any]] = []
+
+        for keyword in all_keywords:
+
+            if keyword in text_lower:
+                matched.append({"keyword": keyword, "match_type": "exact", "confidence": 0.95})
+                continue
+
+            best_ratio = 0.0
+            for line in lines:
+                ratio = difflib.SequenceMatcher(None, keyword, line).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+
+            if best_ratio >= FUZZY_MATCH_CUTOFF:
+                matched.append({
+                    "keyword": keyword,
+                    "match_type": "fuzzy",
+                    "confidence": round(best_ratio, 2),
+                })
+
+        if not matched:
+            return [], 0.0
+
+        avg_confidence = sum(m["confidence"] for m in matched) / len(matched) * 100
+        return matched, round(avg_confidence, 2)
+
+    # =====================================================
+    # Confidence Engine
+    # Combines template + feature + OCR + verification-text confidence into
+    # one overall score, adjusted by the rule-based verification table.
+    # =====================================================
+
+    def _compute_overall_verification_confidence(
+        self,
+        symbol_label: str,
+        shape_feature_score: float,
+        ocr_confidence: float,
+        text_confidence: float,
+        matched_positive: bool,
+        matched_pending: bool,
+    ) -> Tuple[float, str]:
+
+        base = (
+            (shape_feature_score * 100 * 0.40)
+            + (ocr_confidence * 0.20)
+            + (text_confidence * 0.40)
+        )
+
+        if symbol_label == "Green Tick" and matched_positive:
+            rule = "Green Tick + Verified Text = Very High Confidence"
+            final = max(base, 90.0)
+
+        elif symbol_label == "Yellow Question Mark" and matched_pending:
+            rule = "Yellow Question + Pending Verification Text = Medium Confidence"
+            final = min(max(base, 45.0), 65.0)
+
+        elif symbol_label == "Green Tick" and not matched_positive:
+            rule = "Green Tick + No Verification Text = Medium Confidence"
+            final = min(max(base, 55.0), 75.0)
+
+        elif symbol_label == "Not Detected" and matched_positive:
+            rule = "No Symbol + Verified Text Found = Medium Confidence"
+            final = min(max(base, 45.0), 65.0)
+
+        else:
+            rule = "No Symbol + No Verification Text = Low Confidence"
+            final = min(base, 30.0)
+
+        return round(max(0.0, min(final, 100.0)), 2), rule
+
     # =====================================================
     # QR Code + Barcode Detection
-    #
-    # Previously, OpenCV's QRCodeDetector could report `qr_detected: true`
-    # purely from finding finder-pattern-like points, even with no decoded
-    # data - which caused a 1D linear barcode to be misreported as a QR
-    # code with null data. Now: pyzbar (when available) is the primary
-    # source of TRUTH for both detection and type classification, since it
-    # actually distinguishes barcode symbologies from QR codes. OpenCV is
-    # only trusted to confirm a QR code when it successfully DECODES data -
-    # a bare "points detected, no data" result is now reported separately as
-    # an unconfirmed code region rather than a false QR claim.
     # =====================================================
 
     def detect_qr_and_barcode(self, image: np.ndarray) -> Dict[str, Any]:
@@ -365,8 +917,6 @@ class GovtVerificationService:
             except Exception:
                 logger.exception("Barcode/QR detection via pyzbar failed.")
 
-        # OpenCV as secondary confirmation only - never overrides a
-        # pyzbar-confirmed barcode classification.
         try:
             qr_detector = cv2.QRCodeDetector()
             data, points, _ = qr_detector.detectAndDecode(image)
@@ -378,9 +928,6 @@ class GovtVerificationService:
                         result["qr_data"] = data
                         result["detection_engine"] = result["detection_engine"] or "opencv"
                 elif not result["qr_detected"] and not result["barcode_detected"]:
-                    # A code-like region exists but nothing could be decoded
-                    # by either engine - flagged distinctly instead of being
-                    # silently claimed as a confirmed QR code.
                     result["unconfirmed_code_region_detected"] = True
 
         except Exception:
@@ -390,14 +937,42 @@ class GovtVerificationService:
 
     # =====================================================
     # Seal / Emblem / Government Logo Detection
-    #
-    # The previous Hough Circle pass had no post-filter, so it counted
-    # letter loops, dotted borders, and scan noise as "seal candidates"
-    # (24 on a document with exactly one visible seal). Each candidate
-    # circle is now checked for a plausible ink-density ratio inside it -
-    # a real stamped seal has a moderate, textured dark-pixel coverage
-    # (from its printed pattern/text), not near-empty or near-solid.
     # =====================================================
+
+    def _deduplicate_circles(
+        self, circles: List[Tuple[int, int, int]]
+    ) -> List[Tuple[int, int, int]]:
+        """
+        Hough Circle detection commonly returns several near-concentric
+        circles (slightly different radii) around the SAME real stamped
+        seal, inflating the candidate count. This merges circles whose
+        centers are close relative to their radius into a single
+        representative (the largest radius in the cluster), so one real
+        seal is reported once instead of many times.
+        """
+
+        if not circles:
+            return []
+
+        remaining = list(circles)
+        clusters: List[Tuple[int, int, int]] = []
+
+        while remaining:
+            base_x, base_y, base_r = remaining.pop(0)
+            cluster = [(base_x, base_y, base_r)]
+
+            still_remaining = []
+            for (x, y, r) in remaining:
+                distance = ((x - base_x) ** 2 + (y - base_y) ** 2) ** 0.5
+                if distance <= max(base_r, r) * 1.2:
+                    cluster.append((x, y, r))
+                else:
+                    still_remaining.append((x, y, r))
+
+            remaining = still_remaining
+            clusters.append(max(cluster, key=lambda c: c[2]))
+
+        return clusters
 
     def detect_seal_or_emblem(self, image: np.ndarray) -> Dict[str, Any]:
 
@@ -435,15 +1010,14 @@ class GovtVerificationService:
 
                 dark_ratio = float(np.count_nonzero(region_pixels < 150)) / region_pixels.size
 
-                # A real seal/stamp has visible ink texture: neither
-                # near-blank (dark_ratio ~0) nor a solid dark blob
-                # (dark_ratio ~1, which is more likely a photo or shadow).
                 if 0.05 < dark_ratio < 0.6:
                     confirmed.append((int(x), int(y), int(r)))
 
+            deduplicated = self._deduplicate_circles(confirmed)
+
             return {
-                "seal_detected": len(confirmed) > 0,
-                "seal_candidate_count": len(confirmed),
+                "seal_detected": len(deduplicated) > 0,
+                "seal_candidate_count": len(deduplicated),
             }
 
         except Exception:
@@ -452,14 +1026,6 @@ class GovtVerificationService:
 
     # =====================================================
     # Watermark Detection
-    #
-    # The 0.15 page-wide-ratio threshold assumed a watermark covers a large
-    # fraction of the entire page. Real watermarks (e.g. a faint slogan
-    # printed once near the middle of a certificate) are much smaller and
-    # were falling under that bar. Threshold lowered based on observed
-    # real-certificate ratios, and the search is now also restricted to a
-    # margin-excluded central region to avoid header/footer/seal edges
-    # inflating the faint-region count.
     # =====================================================
 
     def detect_watermark(self, image: np.ndarray) -> Dict[str, Any]:
@@ -496,11 +1062,7 @@ class GovtVerificationService:
             return {"watermark_detected": False, "faint_region_ratio": 0.0}
 
     # =====================================================
-    # Text-Based Indicators (digital signature / verification URL)
-    #
-    # Now also matches against a punctuation-normalized copy of the OCR
-    # text, so URLs fragmented by OCR spacing artifacts
-    # ("https :// example . gov . in") are still recognized.
+    # Text-Based Indicators (whole-document OCR text: digital signature / URL)
     # =====================================================
 
     def detect_text_indicators(self, ocr_text: Optional[str]) -> Dict[str, Any]:
