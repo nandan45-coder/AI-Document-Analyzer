@@ -42,11 +42,17 @@ class GovtReportService:
 
             # ----------------------------------------
             # Verification (now also receives OCR text for
-            # text-based indicators like digital signatures / URLs)
+            # text-based indicators like digital signatures / URLs, and the
+            # classified document_type so the verification-region search
+            # can start from the correct location for this document type -
+            # e.g. Aadhaar Card and Migration Certificate place their
+            # symbol somewhere other than the common bottom-right spot).
             # ----------------------------------------
 
             verification_result = govt_verification_service.verify_document(
-                file_path, ocr_text=ocr_result["clean_text"]
+                file_path,
+                ocr_text=ocr_result["clean_text"],
+                document_type=classifier_result["document_type"],
             )
 
             if not verification_result["success"]:

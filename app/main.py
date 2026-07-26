@@ -7,6 +7,7 @@ from app.database import engine, Base
 from app.models.document import Document
 from app.models.chunk import Chunk
 from app.models.embedding import Embedding
+from app.models.user import User
 
 # Import Routes
 from app.routes.upload import router
@@ -47,6 +48,9 @@ from app.routes.interview import (
 from app.routes.govt_document import (
     router as govt_document_router
 )
+from app.routes.auth import (
+    router as auth_router
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,6 +84,8 @@ app.include_router(resume_improver_router)
 app.include_router(score_dashboard_router)
 app.include_router(interview_router)
 app.include_router(govt_document_router)
+app.include_router(auth_router)
+
 
 
 

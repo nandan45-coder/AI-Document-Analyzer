@@ -105,6 +105,7 @@ class GovtFieldValidatorService:
         self.validate_taluka(report)
         self.validate_pin(report)
         self.validate_category(report)
+        self.validate_aadhaar_number(report)
 
         if report["missing_fields"] or report["invalid_fields"]:
             report["valid"] = False
@@ -298,6 +299,41 @@ class GovtFieldValidatorService:
                     report, key,
                     "Unrecognized Category Value - Contains Unexpected "
                     "Characters, Possible OCR Error",
+                    confidence=0.2,
+                )
+
+
+    # ============================================
+    # Aadhaar Number Validation
+    # ============================================
+
+    def validate_aadhaar_number(self, report: Dict[str, Any]) -> None:
+        """
+        Printed/downloaded Aadhaar copies almost always mask most of the
+        12-digit number for privacy (e.g. "xxxx xxxx 2076") - that masking
+        is standard UIDAI practice, not an OCR error, so it must be
+        accepted as valid rather than rejected for "missing digits".
+        Both the fully-masked and (rarer) fully-visible formats are
+        accepted; anything else is flagged as a likely OCR/extraction error.
+        """
+
+        for key, value in report["validated_fields"].items():
+
+            if key.lower() != "aadhaar number":
+                continue
+
+            normalized = value.strip().lower()
+
+            full_number = re.match(r"^\d{4}\s?\d{4}\s?\d{4}$", normalized)
+            masked_number = re.match(r"^x{4}\s?x{4}\s?\d{4}$", normalized)
+
+            if full_number or masked_number:
+                self._set_field_confidence(report, key, 0.9)
+            else:
+                self._mark_invalid(
+                    report, key,
+                    "Unrecognized Aadhaar Number Format - Expected 12 Digits "
+                    "or UIDAI-Standard Masked Format (xxxx xxxx dddd)",
                     confidence=0.2,
                 )
 

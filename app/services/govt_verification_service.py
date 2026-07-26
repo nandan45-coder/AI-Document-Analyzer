@@ -8,6 +8,7 @@ import cv2
 import fitz
 import numpy as np
 
+from app.data.govt_document_types import GOVT_DOCUMENT_TYPES
 from app.services.govt_ocr_service import govt_ocr_service
 from app.utils.govt_common import PDF_RENDER_ZOOM, normalize_ocr_spacing
 
@@ -160,6 +161,7 @@ class GovtVerificationService:
         self,
         file_path: str,
         ocr_text: Optional[str] = None,
+        document_type: Optional[str] = None,
     ) -> Dict[str, Any]:
 
         try:
@@ -167,16 +169,21 @@ class GovtVerificationService:
 
             physical_size_cm = self._get_physical_page_size_cm(file_path)
 
-            crop, offset, region_meta = self._get_verification_crop(image, physical_size_cm)
+            region_hint = self._get_region_hint(document_type)
+
+            crop, offset, region_meta = self._get_verification_crop(
+                image, physical_size_cm, region_hint
+            )
 
             primary = self._analyze_verification_region(
-                crop, offset, region_meta, stage="bottom_right_crop"
+                crop, offset, region_meta, stage=f"{region_hint}_crop"
             )
 
             # Secondary whole-document search only runs if the targeted
             # region found neither a symbol nor supporting verification
             # text - keeps the common case fast while staying robust for
-            # the minority of documents laid out differently.
+            # the minority of documents laid out differently (or an
+            # unrecognized document type with no region hint yet).
             if not primary["symbol_found"] and not primary["verification_text_found"]:
                 fallback_meta = {
                     "location": "Full Page (Fallback)",
@@ -314,6 +321,43 @@ class GovtVerificationService:
         self,
         image: np.ndarray,
         physical_size_cm: Optional[Tuple[float, float]],
+        region_hint: str = "bottom_right",
+    ) -> Tuple[np.ndarray, Tuple[int, int], Dict[str, Any]]:
+        """
+        Routes to a document-type-specific crop when one is known (see
+        _get_region_hint) - not every document places its verification
+        symbol bottom-right. Falls back to the bottom-right crop, which
+        remains correct for the majority of Maharashtra state certificates.
+        """
+
+        if region_hint == "middle_left":
+            return self._get_middle_left_crop(image)
+
+        if region_hint == "middle_right":
+            return self._get_middle_right_crop(image)
+
+        return self._get_bottom_right_crop(image, physical_size_cm)
+
+    def _get_region_hint(self, document_type: Optional[str]) -> str:
+        """
+        Looks up a per-document-type expected verification-symbol location
+        from GOVT_DOCUMENT_TYPES (e.g. Aadhaar Card's tick sits middle-left,
+        Migration Certificate's sits middle-right, unlike most Maharashtra
+        state certificates' bottom-right placement). Falls back to
+        "bottom_right" - the common case - if the document type is unknown
+        or has no explicit hint configured.
+        """
+
+        if not document_type:
+            return "bottom_right"
+
+        type_meta = GOVT_DOCUMENT_TYPES.get(document_type, {})
+        return type_meta.get("verification_region_hint", "bottom_right")
+
+    def _get_bottom_right_crop(
+        self,
+        image: np.ndarray,
+        physical_size_cm: Optional[Tuple[float, float]],
     ) -> Tuple[np.ndarray, Tuple[int, int], Dict[str, Any]]:
 
         height, width = image.shape[:2]
@@ -342,6 +386,79 @@ class GovtVerificationService:
                 "height": round(crop_h_fraction * 100, 2),
             },
             "bounding_box": [left, top, width - left, height - top],
+        }
+
+        return crop, (left, top), region_meta
+
+    def _get_middle_left_crop(
+        self, image: np.ndarray
+    ) -> Tuple[np.ndarray, Tuple[int, int], Dict[str, Any]]:
+        """
+        Aadhaar Card's "Signature valid" tick sits on the LEFT side of the
+        page, roughly a third of the way down - well above the bottom
+        crop's range and on the opposite side from every other supported
+        certificate. Measured against a real UIDAI e-Aadhaar PDF render,
+        it consistently falls around x: 5-30%, y: 55-65% of the front-page
+        panel. Bounds below use a generous margin around that.
+        """
+
+        height, width = image.shape[:2]
+
+        left = 0
+        right = int(width * 0.40)
+        top = int(height * 0.45)
+        bottom = int(height * 0.75)
+
+        crop = image[top:bottom, left:right]
+
+        if crop.size == 0:
+            crop = image
+            left, top = 0, 0
+
+        region_meta = {
+            "location": "Middle Left",
+            "crop_percentage": {
+                "width": round(((right - left) / width) * 100, 2),
+                "height": round(((bottom - top) / height) * 100, 2),
+            },
+            "bounding_box": [left, top, right - left, bottom - top],
+        }
+
+        return crop, (left, top), region_meta
+
+    def _get_middle_right_crop(
+        self, image: np.ndarray
+    ) -> Tuple[np.ndarray, Tuple[int, int], Dict[str, Any]]:
+        """
+        Migration Certificate's "Signature valid" tick sits to the RIGHT of
+        the page, roughly mid-page vertically (near the "Authorized
+        Signatory" line) - well above the bottom crop's range, since the
+        certificate's actual content is compressed into the upper half of
+        an otherwise mostly-blank page. Bounds below use a generous margin
+        around the measured position to tolerate layout variation across
+        similarly-formatted digitally-signed certificates.
+        """
+
+        height, width = image.shape[:2]
+
+        left = int(width * 0.55)
+        right = width
+        top = int(height * 0.30)
+        bottom = int(height * 0.62)
+
+        crop = image[top:bottom, left:right]
+
+        if crop.size == 0:
+            crop = image
+            left, top = 0, 0
+
+        region_meta = {
+            "location": "Middle Right",
+            "crop_percentage": {
+                "width": round(((right - left) / width) * 100, 2),
+                "height": round(((bottom - top) / height) * 100, 2),
+            },
+            "bounding_box": [left, top, right - left, bottom - top],
         }
 
         return crop, (left, top), region_meta
