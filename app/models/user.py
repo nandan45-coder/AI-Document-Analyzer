@@ -1,11 +1,11 @@
+from datetime import datetime
+
 from sqlalchemy import (
     Column,
     Integer,
     String,
     DateTime,
 )
-
-from sqlalchemy.sql import func
 
 from app.database import Base
 
@@ -57,8 +57,8 @@ class User(Base):
     )
 
     created_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
+        DateTime,
+        default=datetime.now,
     )
 
     # NOTE for future modules: reference this table via

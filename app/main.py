@@ -51,6 +51,9 @@ from app.routes.govt_document import (
 from app.routes.auth import (
     router as auth_router
 )
+from app.routes.profile import (
+    router as profile_router
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,6 +88,7 @@ app.include_router(score_dashboard_router)
 app.include_router(interview_router)
 app.include_router(govt_document_router)
 app.include_router(auth_router)
+app.include_router(profile_router)
 
 
 
