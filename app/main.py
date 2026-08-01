@@ -1,5 +1,5 @@
-import logging
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.database import engine, Base
 
@@ -8,6 +8,8 @@ from app.models.document import Document
 from app.models.chunk import Chunk
 from app.models.embedding import Embedding
 from app.models.user import User
+from app.models.resume_history import ResumeHistory
+from app.models.govt_document_history import GovernmentDocumentHistory
 
 # Import Routes
 from app.routes.upload import router
@@ -54,10 +56,8 @@ from app.routes.auth import (
 from app.routes.profile import (
     router as profile_router
 )
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+from app.routes.dashboard import (
+    router as dashboard_router
 )
 
 # Create Database Tables
@@ -68,6 +68,13 @@ app = FastAPI(
     title="AI Document Analyzer",
     description="AI-powered Document Analysis System",
     version="1.0.0"
+)
+
+# Serve uploaded files (profile pictures, etc.) as static content.
+app.mount(
+    "/uploads",
+    StaticFiles(directory="uploads"),
+    name="uploads",
 )
 
 # Register Routes
@@ -89,7 +96,7 @@ app.include_router(interview_router)
 app.include_router(govt_document_router)
 app.include_router(auth_router)
 app.include_router(profile_router)
-
+app.include_router(dashboard_router)
 
 
 
@@ -106,4 +113,3 @@ def health_check():
         "status": "healthy",
         "application": "AI Document Analyzer"
     }
-
