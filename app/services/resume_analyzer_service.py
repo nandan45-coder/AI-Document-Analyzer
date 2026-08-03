@@ -61,27 +61,24 @@ Resume:
 {context}
 """
 
-    response = model.generate_content(
-        prompt
-    )
-
-    cleaned_response = (
-        response.text
-        .replace("```json", "")
-        .replace("```", "")
-        .strip()
-    )
-
     try:
+        response = model.generate_content(
+            prompt
+        )
+
+        cleaned_response = (
+            response.text
+            .replace("```json", "")
+            .replace("```", "")
+            .strip()
+        )
+
         return json.loads(
             cleaned_response
         )
 
-    except Exception:
-
+    except Exception as e:
         return {
-            "error":
-            "JSON Parsing Failed",
-            "raw_output":
-            response.text
+            "error": "Resume Analysis Failed",
+            "details": str(e)
         }

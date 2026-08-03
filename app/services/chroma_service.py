@@ -122,7 +122,17 @@ def search_documents(
     # Sort chunks so that query-relevant results are displayed FIRST
     scored_results.sort(key=lambda x: x[0], reverse=True)
 
-    top_docs = [doc for _, doc in scored_results[:top_k]]
+    # Deduplicate docs while preserving rank order to prevent duplicate matches
+    seen_docs = set()
+    top_docs = []
+    for _, doc in scored_results:
+        normalized_doc = doc.strip()
+        if normalized_doc not in seen_docs:
+            seen_docs.add(normalized_doc)
+            top_docs.append(doc)
+        if len(top_docs) == top_k:
+            break
+
     results["documents"] = [top_docs]
 
     return results
