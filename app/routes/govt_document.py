@@ -13,7 +13,7 @@ from fastapi import (
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import get_optional_current_user
 from app.models.govt_document_history import GovernmentDocumentHistory
 from app.models.user import User
 
@@ -60,7 +60,11 @@ async def analyze_document(
 
     file: UploadFile = File(...),
 
-    current_user: User = Depends(get_current_user),
+    # Permanently open regardless of AUTH_ENABLED - this is core product
+    # functionality. If a valid token IS sent, the real user gets credit
+    # in history; otherwise it's attributed to the shared placeholder
+    # user. See get_optional_current_user in app/dependencies.py.
+    current_user: User = Depends(get_optional_current_user),
 
     db: Session = Depends(get_db),
 

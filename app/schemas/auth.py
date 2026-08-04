@@ -5,6 +5,7 @@ from typing import Optional
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.utils.password_handler import validate_password_strength
+from app.utils.security_questions import is_valid_security_question
 
 
 MOBILE_PATTERN = re.compile(r"^[6-9]\d{9}$")
@@ -44,6 +45,19 @@ class UserRegisterRequest(BaseModel):
     password: str
 
     confirm_password: str
+
+    security_question: str = Field(..., min_length=3, max_length=255)
+
+    security_answer: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("security_question")
+    @classmethod
+    def validate_security_question(cls, value: str) -> str:
+        if not is_valid_security_question(value):
+            raise ValueError(
+                "Invalid security question. Please select one of the system-provided security questions."
+            )
+        return value.strip()
 
     @field_validator("username")
     @classmethod
@@ -138,22 +152,72 @@ class ChangePasswordRequest(BaseModel):
 
 
 # =====================================================
-# Forgot Password (structure only - not implemented yet)
+# Forgot Password (Security Question Flow)
 # =====================================================
 
 class ForgotPasswordRequest(BaseModel):
     """
-    Structure only, per Phase 1 scope. No OTP/email is sent yet - this
-    exists so the /auth/forgot-password endpoint and service method have
-    a stable request contract that a future phase can implement behind
-    without any breaking change here.
+    Handles password reset via Security Question:
+    - Step 1 (Retrieval): Provide `username_or_email` (or `email`) to get the user's registered security question.
+    - Step 2 (Reset): Provide `username_or_email`, `security_answer`, `new_password`, and `confirm_new_password` to update password.
     """
 
-    email: EmailStr
+    username_or_email: Optional[str] = Field(None, description="Username or Email address")
+
+    email: Optional[str] = Field(None, description="Email address")
+
+    security_question: Optional[str] = Field(None, description="User's security question")
+
+    security_answer: Optional[str] = Field(None, description="Security question answer")
+
+    new_password: Optional[str] = Field(None, description="New password")
+
+    confirm_new_password: Optional[str] = Field(None, description="Confirm new password")
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "ForgotPasswordRequest":
+        identifier = self.username_or_email or self.email
+        if not identifier or not str(identifier).strip():
+            raise ValueError("Username or Email is required.")
+
+        is_reset_attempt = (
+            self.security_answer is not None
+            or self.new_password is not None
+            or self.confirm_new_password is not None
+        )
+
+        if is_reset_attempt:
+            if not self.security_answer or not str(self.security_answer).strip():
+                raise ValueError("Security answer is required.")
+            if not self.new_password:
+                raise ValueError("New password is required.")
+            if not self.confirm_new_password:
+                raise ValueError("Confirm new password is required.")
+            if self.new_password != self.confirm_new_password:
+                raise ValueError("New Password and Confirm New Password do not match.")
+
+            is_valid, reason = validate_password_strength(self.new_password)
+            if not is_valid:
+                raise ValueError(reason)
+
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "username_or_email": "user123",
+                "email": "user@example.com",
+                "security_question": "In what city or town were you born?",
+                "security_answer": "CityName",
+                "new_password": "NewPassword@123",
+                "confirm_new_password": "NewPassword@123"
+            }
+        }
+    }
 
 
 # =====================================================
-# User Response (safe to return - never includes password_hash)
+# User Response (safe to return - never includes password_hash or security_answer)
 # =====================================================
 
 class UserResponse(BaseModel):
@@ -169,6 +233,8 @@ class UserResponse(BaseModel):
     mobile: str
 
     profile_image: Optional[str] = None
+
+    security_question: Optional[str] = None
 
     created_at: datetime
 

@@ -34,6 +34,15 @@ def run_migrations():
                     if col_name not in cols:
                         cursor.execute(f"ALTER TABLE resume_history ADD COLUMN {col_name} {col_type}")
                 conn.commit()
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users';")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(users)")
+                cols = {row[1] for row in cursor.fetchall()}
+                for col_name, col_type in [("security_question", "VARCHAR"), ("security_answer", "VARCHAR")]:
+                    if col_name not in cols:
+                        cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+                conn.commit()
             conn.close()
         except Exception:
             pass

@@ -22,6 +22,23 @@ class Settings(BaseSettings):
 
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
+    # -------------------------------------------------
+    # Temporary Auth Bypass Switch
+    #
+    # Defaults to True (auth fully enforced, current behavior unchanged).
+    # Set AUTH_ENABLED=false in .env to temporarily disable authentication
+    # across EVERY protected route in EVERY module in one place (see
+    # app/dependencies.py) - no route files need to change either way.
+    #
+    # WARNING: when False, every request (with or without a token) is
+    # treated as the same shared placeholder user. There is NO real
+    # access control in this mode - local/solo dev use only, never on
+    # anything publicly reachable. Revert to true (or remove the line
+    # from .env) to restore normal authentication.
+    # -------------------------------------------------
+
+    AUTH_ENABLED: bool = True
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -1,7 +1,8 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.models.user import User
 from app.services.auth_service import auth_service
@@ -18,7 +19,12 @@ from app.utils.jwt_handler import (
 # /auth/login and would never actually work from that dialog. This change
 # only affects how the token is read out of the Authorization header for
 # docs/testing convenience - get_current_user's behavior is unchanged.
-bearer_scheme = HTTPBearer(auto_error=True)
+#
+# auto_error=False (not True) is required to support the AUTH_ENABLED
+# bypass below - when auth is disabled, requests may have no
+# Authorization header at all, and that must not raise before this
+# function's body even runs.
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def get_current_user(
@@ -26,13 +32,28 @@ def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
     """
-    Reusable authentication dependency. Every future protected route in
-    every future module should only need:
-
-        current_user: User = Depends(get_current_user)
-
-    without re-implementing any JWT logic.
+    Reusable authentication dependency. Every protected route in every
+    module goes through this ONE function - which is exactly why
+    AUTH_ENABLED (app/config.py) can disable authentication everywhere at
+    once from a single place, with zero changes needed in profile.py,
+    dashboard.py, resume.py, govt_document.py, or any future module.
     """
+
+    # -------------------------------------------------
+    # TEMPORARY BYPASS - see AUTH_ENABLED in app/config.py.
+    # Every request, regardless of what (if any) token it sends, is
+    # treated as the same shared placeholder user. No real
+    # authentication or access control happens in this branch.
+    # -------------------------------------------------
+    if not settings.AUTH_ENABLED:
+        return auth_service.get_or_create_placeholder_user(db)
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     token = credentials.credentials
 
@@ -74,3 +95,54 @@ def get_current_user(
         )
 
     return user
+
+
+def get_optional_current_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> User:
+    """
+    Like get_current_user, but with two differences:
+
+    1. NEVER raises 401 - falls back to a shared placeholder user instead
+       of blocking the request when no valid token is present.
+
+    2. Does NOT show a padlock in Swagger/OpenAPI docs. FastAPI marks a
+       route as "security required" based purely on whether it depends on
+       a SecurityBase class (like HTTPBearer) - NOT on what the function
+       actually does at runtime. get_current_user uses Depends(bearer_scheme),
+       so it always shows a padlock even if AUTH_ENABLED is False. This
+       function reads the Authorization header manually via Header()
+       instead, which FastAPI does NOT treat as a security requirement -
+       so routes using this show up as fully open in the docs, matching
+       how they actually behave right now while the frontend has no
+       login flow built yet.
+
+    - Valid "Bearer <token>" header present -> returns the REAL
+      authenticated user, so history/data is still correctly attributed
+      to them once real login exists on the frontend.
+    - No header / malformed header / invalid / expired token -> silently
+      falls back to the shared placeholder user.
+
+    To re-lock a specific route later (once frontend auth pages exist),
+    just swap this import back to get_current_user in that route file -
+    nothing else needs to change.
+    """
+
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+
+        if scheme.lower() == "bearer" and token:
+            try:
+                payload = decode_access_token(token)
+                user_id = payload.get("sub")
+
+                if user_id is not None:
+                    user = auth_service.get_user_by_id(db, int(user_id))
+                    if user is not None:
+                        return user
+
+            except (TokenExpiredError, TokenInvalidError):
+                pass  # fall through to placeholder below
+
+    return auth_service.get_or_create_placeholder_user(db)

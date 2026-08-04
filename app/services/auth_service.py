@@ -36,6 +36,49 @@ class AuthService:
         return db.query(User).filter(User.mobile == mobile).first()
 
     # =====================================================
+    # Placeholder User (only used when AUTH_ENABLED=false)
+    #
+    # Fetches or creates the single shared account that every request is
+    # attributed to while authentication is temporarily disabled. Kept
+    # here alongside the other user-lookup methods rather than in
+    # dependencies.py, so all user-fetching logic stays in one place.
+    # =====================================================
+
+    PLACEHOLDER_USERNAME = "system_default_user"
+
+    def get_or_create_placeholder_user(self, db: Session) -> User:
+
+        placeholder = self.get_user_by_username(db, self.PLACEHOLDER_USERNAME)
+
+        if placeholder:
+            return placeholder
+
+        placeholder = User(
+            full_name="Default User (Auth Disabled)",
+            username=self.PLACEHOLDER_USERNAME,
+            email="system_default_user@local.placeholder",
+            mobile="0000000000",
+            # Never actually used to log in while auth is disabled - this
+            # is just a valid-looking hash so the column constraint is
+            # satisfied, not a real credential.
+            password_hash=hash_password("placeholder-not-a-real-password"),
+        )
+
+        db.add(placeholder)
+        db.commit()
+        db.refresh(placeholder)
+
+        logger.warning(
+            "Using shared placeholder user_id=%s for an unauthenticated "
+            "request (either AUTH_ENABLED is False globally, or this "
+            "specific route uses get_optional_current_user). No real "
+            "access control applies to this request.",
+            placeholder.id,
+        )
+
+        return placeholder
+
+    # =====================================================
     # Registration
     # =====================================================
 

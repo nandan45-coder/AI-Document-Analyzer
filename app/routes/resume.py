@@ -2,8 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_current_user
-from app.models.document import Document
+from app.dependencies import get_optional_current_user
 from app.models.resume_history import ResumeHistory
 from app.models.user import User
 
@@ -19,7 +18,11 @@ router = APIRouter()
 )
 def resume_analysis(
     document_id: int,
-    current_user: User = Depends(get_current_user),
+    # Permanently open regardless of AUTH_ENABLED - this is core product
+    # functionality. If a valid token IS sent, the real user gets credit
+    # in history; otherwise it's attributed to the shared placeholder
+    # user. See get_optional_current_user in app/dependencies.py.
+    current_user: User = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
 
@@ -46,13 +49,6 @@ def resume_analysis(
             user_id=current_user.id,
             document_id=document_id,
             candidate_name=result.get("candidate_name") or None,
-            # Not populated by analyze_resume() today - these stay None
-            # until a real scoring pipeline is wired in. Reading them
-            # defensively here means that whenever that day comes, this
-            # line needs zero changes - the values just stop being None.
-            resume_score=result.get("resume_score"),
-            ats_score=result.get("ats_score"),
-            recommended_role=result.get("recommended_role"),
         )
 
         db.add(history_entry)

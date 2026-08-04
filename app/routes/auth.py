@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import get_optional_current_user
 from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
@@ -99,7 +99,7 @@ def login(
 
 @router.post("/logout")
 def logout(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_optional_current_user),
 ):
     # TODO (future phase): record this token's "jti" in a blacklist store
     # with a TTL matching its remaining expiry, and check that store inside
@@ -117,7 +117,7 @@ def logout(
 @router.post("/change-password")
 def change_password(
     request: ChangePasswordRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     result = auth_service.change_password(db, current_user, request)
@@ -161,6 +161,6 @@ def forgot_password(
     response_model=UserResponse,
 )
 def get_me(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_optional_current_user),
 ):
     return current_user

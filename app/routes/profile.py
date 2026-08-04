@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import get_optional_current_user
 from app.models.user import User
 from app.schemas.profile import (
     ProfileImageResponse,
@@ -32,7 +32,7 @@ router = APIRouter(
 )
 def update_profile(
     request: ProfileUpdateRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     result = profile_service.update_profile(db, current_user, request)
@@ -67,7 +67,7 @@ def update_profile(
 )
 def upload_image(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     result = profile_service.upload_profile_image(db, current_user, file)
@@ -97,7 +97,7 @@ def upload_image(
     response_model=ProfileImageResponse,
 )
 def remove_image(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     result = profile_service.remove_profile_image(db, current_user)

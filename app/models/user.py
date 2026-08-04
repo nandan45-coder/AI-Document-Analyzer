@@ -56,6 +56,16 @@ class User(Base):
         nullable=True,
     )
 
+    security_question = Column(
+        String,
+        nullable=True,
+    )
+
+    security_answer = Column(
+        String,
+        nullable=True,
+    )
+
     created_at = Column(
         DateTime,
         default=datetime.now,
