@@ -1,4 +1,4 @@
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -98,7 +98,7 @@ def get_current_user(
 
 
 def get_optional_current_user(
-    authorization: str | None = Header(default=None),
+    request: Request,
     db: Session = Depends(get_db),
 ) -> User:
     """
@@ -107,27 +107,15 @@ def get_optional_current_user(
     1. NEVER raises 401 - falls back to a shared placeholder user instead
        of blocking the request when no valid token is present.
 
-    2. Does NOT show a padlock in Swagger/OpenAPI docs. FastAPI marks a
-       route as "security required" based purely on whether it depends on
-       a SecurityBase class (like HTTPBearer) - NOT on what the function
-       actually does at runtime. get_current_user uses Depends(bearer_scheme),
-       so it always shows a padlock even if AUTH_ENABLED is False. This
-       function reads the Authorization header manually via Header()
-       instead, which FastAPI does NOT treat as a security requirement -
-       so routes using this show up as fully open in the docs, matching
-       how they actually behave right now while the frontend has no
-       login flow built yet.
+    2. Does NOT show authorization input box in Swagger/OpenAPI docs.
 
     - Valid "Bearer <token>" header present -> returns the REAL
-      authenticated user, so history/data is still correctly attributed
-      to them once real login exists on the frontend.
+      authenticated user.
     - No header / malformed header / invalid / expired token -> silently
       falls back to the shared placeholder user.
-
-    To re-lock a specific route later (once frontend auth pages exist),
-    just swap this import back to get_current_user in that route file -
-    nothing else needs to change.
     """
+
+    authorization = request.headers.get("Authorization") or request.headers.get("authorization")
 
     if authorization:
         scheme, _, token = authorization.partition(" ")
